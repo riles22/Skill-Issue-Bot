@@ -101,6 +101,50 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Hosting (running it off your own machine)
+
+The bot is a small always-on worker — it needs no open ports, no domain, and
+about 256–512 MB of RAM. Any of these gets it off your PC:
+
+### Option A: Railway (easiest)
+
+1. Sign up at [railway.app](https://railway.app) and choose **Deploy from
+   GitHub repo** → this repository. It detects the Dockerfile automatically.
+2. Add a `DISCORD_TOKEN` variable under the service's **Variables** tab.
+3. Done. Every push to `main` redeploys automatically. (Hobby plan, ~$5/mo;
+   this bot uses a fraction of that in actual usage.)
+
+Render, Fly.io, and similar platforms work the same way — deploy it as a
+**background worker**, not a web service. Avoid free tiers that sleep on
+idle: a Discord bot must stay connected 24/7.
+
+### Option B: any VPS or free cloud VM
+
+Works on a $4–6/mo VPS (Hetzner, DigitalOcean) or Oracle Cloud's Always Free
+VM. With Docker installed:
+
+```bash
+git clone https://github.com/riles22/Skill-Issue-Bot.git && cd Skill-Issue-Bot
+cp .env.example .env   # paste your token
+docker compose up -d --build
+```
+
+`restart: unless-stopped` keeps it running across crashes and reboots.
+
+### Option C: prebuilt image, no cloning
+
+CI publishes an image to GitHub Container Registry on every push to `main`,
+so a host only needs Docker and the token:
+
+```bash
+docker run -d --restart unless-stopped \
+  -e DISCORD_TOKEN=your-token-here \
+  ghcr.io/riles22/skill-issue-bot:latest
+```
+
+> **Run exactly one instance.** Two copies on the same token both answer
+> every command — stop the local one once the hosted one is online.
+
 ## Tests and linting
 
 ```bash
