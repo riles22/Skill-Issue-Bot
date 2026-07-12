@@ -101,27 +101,23 @@ pip install -r requirements.txt
 python app.py
 ```
 
-## Hosting (running it off your own machine)
+## Hosting (running it off your own machine, for free)
 
 The bot is a small always-on worker — it needs no open ports, no domain, and
-about 256–512 MB of RAM. Any of these gets it off your PC:
+about 256–512 MB of RAM. It must stay connected 24/7, which rules out free
+PaaS tiers that sleep on idle (Render, Koyeb, Replit). The genuinely free
+paths are a free cloud VM or spare hardware at home.
 
-### Option A: Railway (easiest)
+On any host with Docker, running it is one command (the image is published
+for both x86 and ARM on every push to `main`):
 
-1. Sign up at [railway.app](https://railway.app) and choose **Deploy from
-   GitHub repo** → this repository. It detects the Dockerfile automatically.
-2. Add a `DISCORD_TOKEN` variable under the service's **Variables** tab.
-3. Done. Every push to `main` redeploys automatically. (Hobby plan, ~$5/mo;
-   this bot uses a fraction of that in actual usage.)
+```bash
+docker run -d --name skill-issue-bot --restart unless-stopped \
+  -e DISCORD_TOKEN=your-token-here \
+  ghcr.io/riles22/skill-issue-bot:latest
+```
 
-Render, Fly.io, and similar platforms work the same way — deploy it as a
-**background worker**, not a web service. Avoid free tiers that sleep on
-idle: a Discord bot must stay connected 24/7.
-
-### Option B: any VPS or free cloud VM
-
-Works on a $4–6/mo VPS (Hetzner, DigitalOcean) or Oracle Cloud's Always Free
-VM. With Docker installed:
+Or clone the repo and use compose:
 
 ```bash
 git clone https://github.com/riles22/Skill-Issue-Bot.git && cd Skill-Issue-Bot
@@ -129,21 +125,39 @@ cp .env.example .env   # paste your token
 docker compose up -d --build
 ```
 
-`restart: unless-stopped` keeps it running across crashes and reboots.
+`--restart unless-stopped` keeps it alive across crashes and reboots either way.
 
-### Option C: prebuilt image, no cloning
+### Option A: Oracle Cloud Always Free (a real $0-forever VM)
 
-CI publishes an image to GitHub Container Registry on every push to `main`,
-so a host only needs Docker and the token:
+1. Sign up at [oracle.com/cloud/free](https://www.oracle.com/cloud/free/).
+   A card is required for identity verification, but Always Free resources
+   never bill.
+2. Create a Compute instance: shape **VM.Standard.E2.1.Micro** (x86, 1 GB —
+   always available) or **Ampere A1** (ARM, more RAM but region capacity
+   varies). Pick an Ubuntu image and add your SSH key.
+3. SSH in, install Docker (`curl -fsSL https://get.docker.com | sh`), then
+   run the `docker run` command above.
 
-```bash
-docker run -d --restart unless-stopped \
-  -e DISCORD_TOKEN=your-token-here \
-  ghcr.io/riles22/skill-issue-bot:latest
-```
+Google Cloud's **e2-micro** (in `us-west1`/`us-central1`/`us-east1`) is an
+equivalent always-free alternative, with the same card-for-verification
+caveat.
 
-> **Run exactly one instance.** Two copies on the same token both answer
-> every command — stop the local one once the hosted one is online.
+### Option B: spare hardware at home
+
+A Raspberry Pi (3 or newer), an old laptop, or any box that can stay plugged
+in works fine — the published image includes ARM builds, so the same
+`docker run` command applies. Electricity cost for a Pi is a few dollars a
+year.
+
+### Notes
+
+- **Run exactly one instance.** Two copies on the same token both answer
+  every command — stop the local one once the hosted one is online.
+- **Skip third-party "free Discord bot hosting" sites.** They require handing
+  over your bot token and tend to be unreliable.
+- Paid-but-easy managed options (Railway, Render/Fly worker services,
+  ~$5/mo) also deploy this repo directly from GitHub if you ever change your
+  mind.
 
 ## Tests and linting
 
