@@ -1,5 +1,7 @@
 import logging
+import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +17,9 @@ sys.modules['discord.ext.commands'] = MagicMock()
 sys.modules['discord.ext'].commands = sys.modules['discord.ext.commands']
 sys.modules['yt_dlp'] = MagicMock()
 sys.modules['dotenv'] = MagicMock()
+
+# DCASource subclasses discord.AudioSource; give it a real base class
+sys.modules['discord'].AudioSource = object
 
 commands_mock = sys.modules['discord.ext.commands']
 
@@ -64,6 +69,14 @@ def configure_extraction(result=None, error=None):
         ydl_instance.extract_info.return_value = result
     app.yt_dlp.YoutubeDL.return_value.__enter__.return_value = ydl_instance
     return ydl_instance
+
+
+def dca_bytes(*frames):
+    """Build DCA v0 file bytes: int16-LE length-prefixed opus frames."""
+    out = b''
+    for frame in frames:
+        out += len(frame).to_bytes(2, 'little') + frame
+    return out
 
 
 class TestBotLogic(unittest.IsolatedAsyncioTestCase):
@@ -152,6 +165,8 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
         message = ctx.send.call_args.args[0]
         for name in app.CLIPS:
             self.assertIn(f'!{name}', message)
+        for collection in app.SOUND_COLLECTIONS:
+            self.assertIn(f"!{collection['commands'][0]}", message)
 
     async def test_leave_command(self):
         ctx = MagicMock()
@@ -218,6 +233,119 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
         await app.on_voice_state_update(member, MagicMock(), MagicMock())
 
         vc.disconnect.assert_not_awaited()
+
+
+class TestAirhorn(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        app._play_locks.clear()
+        app._play_generation.clear()
+
+    def test_all_collection_sounds_have_files(self):
+        for collection in app.SOUND_COLLECTIONS:
+            for name in collection['sounds']:
+                path = app._sound_path(collection, name)
+                self.assertTrue(os.path.isfile(path), f"missing sound file: {path}")
+
+    def test_all_sound_files_parse_as_dca(self):
+        for collection in app.SOUND_COLLECTIONS:
+            for name in collection['sounds']:
+                source = app.DCASource(app._sound_path(collection, name))
+                frames = 0
+                while True:
+                    frame = source.read()
+                    if not frame:
+                        break
+                    frames += 1
+                    self.assertLess(len(frame), 4000, f"bogus frame in {name}")
+                source.cleanup()
+                # Every sound should hold at least ~200ms of audio
+                self.assertGreater(frames, 10, f"too few frames in {name}")
+
+    def test_dca_source_reads_frames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'test.dca')
+            with open(path, 'wb') as f:
+                f.write(dca_bytes(b'abc', b'defgh'))
+
+            source = app.DCASource(path)
+            self.assertTrue(source.is_opus())
+            self.assertEqual(source.read(), b'abc')
+            self.assertEqual(source.read(), b'defgh')
+            self.assertEqual(source.read(), b'')
+            source.cleanup()
+
+    def test_dca_source_skips_dca1_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'test.dca')
+            metadata = b'{"dca":1}'
+            with open(path, 'wb') as f:
+                f.write(b'DCA1' + len(metadata).to_bytes(4, 'little') + metadata)
+                f.write(dca_bytes(b'opus'))
+
+            source = app.DCASource(path)
+            self.assertEqual(source.read(), b'opus')
+            self.assertEqual(source.read(), b'')
+            source.cleanup()
+
+    def test_dca_source_inserts_gap_between_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, 'a.dca')
+            second = os.path.join(tmp, 'b.dca')
+            with open(first, 'wb') as f:
+                f.write(dca_bytes(b'aa'))
+            with open(second, 'wb') as f:
+                f.write(dca_bytes(b'bb'))
+
+            source = app.DCASource(first, second)
+            self.assertEqual(source.read(), b'aa')
+            silence = 0
+            while (frame := source.read()) == app.OPUS_SILENCE_FRAME:
+                silence += 1
+            self.assertEqual(silence, app.DCASource.GAP_FRAMES)
+            self.assertEqual(frame, b'bb')
+            self.assertEqual(source.read(), b'')
+            source.cleanup()
+
+    async def test_horn_plays_named_sound(self):
+        ctx = MagicMock()
+        with patch.object(app, 'play_local', AsyncMock()) as play:
+            await app.play_horn(ctx, app.AIRHORN, 'truck')
+
+        play.assert_awaited_once()
+        paths = play.call_args.args[1]
+        self.assertEqual(paths, [app._sound_path(app.AIRHORN, 'truck')])
+
+    async def test_horn_rejects_unknown_sound(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        with patch.object(app, 'play_local', AsyncMock()) as play:
+            await app.play_horn(ctx, app.AIRHORN, 'nope')
+
+        play.assert_not_awaited()
+        self.assertIn('Unknown sound', ctx.send.call_args.args[0])
+
+    async def test_khaled_chains_into_airhorn(self):
+        ctx = MagicMock()
+        with patch.object(app, 'play_local', AsyncMock()) as play:
+            await app.play_horn(ctx, app.KHALED)
+
+        paths = play.call_args.args[1]
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(os.path.basename(paths[0]).startswith('another_'))
+        self.assertTrue(os.path.basename(paths[1]).startswith('airhorn_'))
+
+    async def test_play_local_plays_silently(self):
+        ctx, vc = make_voice_ctx()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'horn.dca')
+            with open(path, 'wb') as f:
+                f.write(dca_bytes(b'toot'))
+
+            await app.play_local(ctx, [path])
+
+        vc.play.assert_called_once()
+        self.assertIsInstance(vc.play.call_args.args[0], app.DCASource)
+        ctx.send.assert_not_called()  # successful horn plays are silent
 
 
 if __name__ == '__main__':

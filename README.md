@@ -2,21 +2,42 @@
 
 ![CI](https://github.com/riles22/Skill-Issue-Bot/actions/workflows/ci.yml/badge.svg)
 
-A tiny Discord soundboard bot. It joins your voice channel, plays a meme clip
-streamed from YouTube, and disconnects when the clip ends (or when everyone
-else leaves the channel).
+A tiny Discord soundboard bot. It joins your voice channel, plays a meme clip,
+and disconnects when the clip ends (or when everyone else leaves the channel).
+It also carries a full recreation of the legendary **Airhorn Solutions** bot
+with all of its original sounds.
 
 ## Commands
 
 | Command  | What it does                        |
 |----------|-------------------------------------|
-| `!skill` | Plays the "skill" clip              |
-| `!ded`   | Plays the "ded" clip                |
-| `!clips` | Lists all available clips           |
+| `!skill` | Plays the "skill" clip (YouTube)    |
+| `!ded`   | Plays the "ded" clip (YouTube)      |
+| `!clips` | Lists all available clips & horns   |
 | `!leave` | Disconnects the bot from voice      |
 
-Clip commands share a short per-server cooldown (one play per 3 seconds), and
-triggering a new clip while one is playing interrupts it.
+### Airhorn Solutions
+
+The classic [airhornbot](https://github.com/discord/airhornbot) sound
+collections, with the original audio, weights, aliases, and behavior:
+
+| Command | Aliases | Sounds |
+|---------|---------|--------|
+| `!airhorn` | — | default, reverb, spam, tripletap, fourtap, distant, echo, clownfull, clownshort, clownspam, highfartlong, highfartshort, midshort, truck |
+| `!anotha` | `!anothaone` | one, one_classic, one_echo — always chased by a random airhorn |
+| `!johncena` | `!cena` | airhorn, echo, full, jc, nameis, spam |
+| `!ethan` | `!eb` `!ethanbradberry` `!h3h3` | areyou_classic, areyou_condensed, areyou_crazy, areyou_ethan, classic, echo, high, slowandlow, cuts, beat, sodiepop |
+| `!stan` | `!stanislav` | herd, moo, x3 |
+| `!birthday` | `!bday` | horn, horn3, sadhorn, weakhorn |
+| `!wowthatscool` | `!wtc` | thatscool |
+
+A bare command plays a weighted-random sound from its collection, just like
+the original; add a sound name to pick one (e.g. `!airhorn truck`). Sounds are
+the original pre-encoded Opus `.dca` files played natively — no ffmpeg or
+re-encoding involved (see [sounds/README.md](sounds/README.md) for credits).
+
+All play commands share a short per-server cooldown (one play per 3 seconds),
+and triggering a new clip while one is playing interrupts it.
 
 ### Adding a clip
 
@@ -72,7 +93,8 @@ docker run --env-file .env skill-issue-bot
 ### 3b. Run locally
 
 Requires Python 3.10+ and `ffmpeg` available on your `PATH` (plus libopus,
-which ffmpeg installs pull in on most systems).
+which ffmpeg installs pull in on most systems). ffmpeg is only used for the
+YouTube clips — the airhorn sounds play without it.
 
 ```bash
 pip install -r requirements.txt
