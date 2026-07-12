@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from collections import defaultdict
 
 import discord
@@ -23,7 +24,7 @@ intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Soundboard clips, one command per entry
+# Soundboard clips: each entry becomes a bot command (e.g. !skill)
 CLIPS = {
     'skill': 'https://www.youtube.com/watch?v=LuE0QMHErQo',
     'ded': 'https://www.youtube.com/watch?v=-LTtripsg5U',
@@ -143,16 +144,24 @@ async def play_audio(ctx, url):
         await ctx.send(f"Playing: {title}")
 
 
-@bot.command(name='skill')
-async def skill(ctx):
-    """Plays the 'skill' clip."""
-    await play_audio(ctx, CLIPS['skill'])
+def _make_clip_command(name, url):
+    """Registers a bot command that plays the given clip."""
+    @bot.command(name=name, help=f"Plays the '{name}' clip.")
+    @commands.cooldown(1, 3, commands.BucketType.guild)
+    async def _cmd(ctx):
+        await play_audio(ctx, url)
+    return _cmd
 
 
-@bot.command(name='ded')
-async def ded(ctx):
-    """Plays the 'ded' clip."""
-    await play_audio(ctx, CLIPS['ded'])
+for _name, _url in CLIPS.items():
+    _make_clip_command(_name, _url)
+
+
+@bot.command(name='clips')
+async def clips(ctx):
+    """Lists the available clips."""
+    names = ' '.join(f'`!{name}`' for name in sorted(CLIPS))
+    await ctx.send(f"Available clips: {names}")
 
 
 @bot.command(name='leave')
@@ -170,6 +179,9 @@ async def on_command_error(ctx, error):
     """Reports command errors instead of dumping tracebacks to the console."""
     if isinstance(error, commands.CommandNotFound):
         return
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"Slow down! Try again in {error.retry_after:.1f}s.")
+        return
     log.error('Command %s failed: %s', ctx.command, error)
     await ctx.send(f"Something went wrong: {error}")
 
@@ -186,9 +198,23 @@ async def on_voice_state_update(member, before, after):
             await voice_client.disconnect()
 
 
+async def _main():
+    """Runs the bot, shutting down cleanly on SIGINT/SIGTERM."""
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
+        except NotImplementedError:
+            # Signal handlers aren't supported on Windows event loops
+            pass
+
+    async with bot:
+        await bot.start(TOKEN)
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
     )
-    bot.run(TOKEN, log_handler=None)
+    asyncio.run(_main())

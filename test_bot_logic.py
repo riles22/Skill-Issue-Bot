@@ -16,7 +16,9 @@ sys.modules['discord.ext'].commands = sys.modules['discord.ext.commands']
 sys.modules['yt_dlp'] = MagicMock()
 sys.modules['dotenv'] = MagicMock()
 
-# Configure the mock bot to return the original function when used as a decorator
+commands_mock = sys.modules['discord.ext.commands']
+
+# Configure the mocked decorators to return the original function
 mock_bot = MagicMock()
 def side_effect_decorator(*args, **kwargs):
     def decorator(func):
@@ -24,7 +26,12 @@ def side_effect_decorator(*args, **kwargs):
     return decorator
 mock_bot.command.side_effect = side_effect_decorator
 mock_bot.event.side_effect = lambda func: func
-sys.modules['discord.ext.commands'].Bot.return_value = mock_bot
+commands_mock.Bot.return_value = mock_bot
+commands_mock.cooldown.side_effect = side_effect_decorator
+
+# Real exception types so app code can isinstance() against them
+commands_mock.CommandNotFound = type('CommandNotFound', (Exception,), {})
+commands_mock.CommandOnCooldown = type('CommandOnCooldown', (Exception,), {})
 
 # Now we can import the app logic, with a fake token in place.
 with patch('os.getenv', return_value='FAKE_TOKEN'):
@@ -127,6 +134,25 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
             rct.assert_called_once()
             rct.call_args.args[0].close()  # tidy up the un-awaited coroutine
 
+    async def test_clip_commands_play_their_url(self):
+        cmd = app._make_clip_command('testclip', 'http://clip.url')
+        ctx = MagicMock()
+
+        with patch.object(app, 'play_audio', AsyncMock()) as play:
+            await cmd(ctx)
+
+        play.assert_awaited_once_with(ctx, 'http://clip.url')
+
+    async def test_clips_command_lists_clips(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+
+        await app.clips(ctx)
+
+        message = ctx.send.call_args.args[0]
+        for name in app.CLIPS:
+            self.assertIn(f'!{name}', message)
+
     async def test_leave_command(self):
         ctx = MagicMock()
         ctx.voice_client = AsyncMock()
@@ -136,6 +162,32 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
 
         ctx.voice_client.disconnect.assert_called_once()
         ctx.send.assert_called_with("Disconnected.")
+
+    async def test_command_not_found_is_ignored(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+
+        await app.on_command_error(ctx, commands_mock.CommandNotFound())
+
+        ctx.send.assert_not_called()
+
+    async def test_cooldown_error_is_friendly(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        error = commands_mock.CommandOnCooldown()
+        error.retry_after = 2.5
+
+        await app.on_command_error(ctx, error)
+
+        ctx.send.assert_called_with("Slow down! Try again in 2.5s.")
+
+    async def test_generic_command_error_is_reported(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+
+        await app.on_command_error(ctx, RuntimeError("kaboom"))
+
+        ctx.send.assert_called_with("Something went wrong: kaboom")
 
     async def test_disconnects_when_left_alone(self):
         member = MagicMock()

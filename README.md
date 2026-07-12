@@ -1,5 +1,7 @@
 # Skill Issue Bot
 
+![CI](https://github.com/riles22/Skill-Issue-Bot/actions/workflows/ci.yml/badge.svg)
+
 A tiny Discord soundboard bot. It joins your voice channel, plays a meme clip
 streamed from YouTube, and disconnects when the clip ends (or when everyone
 else leaves the channel).
@@ -10,10 +12,25 @@ else leaves the channel).
 |----------|-------------------------------------|
 | `!skill` | Plays the "skill" clip              |
 | `!ded`   | Plays the "ded" clip                |
+| `!clips` | Lists all available clips           |
 | `!leave` | Disconnects the bot from voice      |
 
-Clips live in the `CLIPS` dict at the top of `app.py` — add an entry and a
-matching command to extend the soundboard.
+Clip commands share a short per-server cooldown (one play per 3 seconds), and
+triggering a new clip while one is playing interrupts it.
+
+### Adding a clip
+
+Add one line to the `CLIPS` dict in `app.py`:
+
+```python
+CLIPS = {
+    'skill': 'https://www.youtube.com/watch?v=LuE0QMHErQo',
+    'ded': 'https://www.youtube.com/watch?v=-LTtripsg5U',
+    'mynewclip': 'https://www.youtube.com/watch?v=...',
+}
+```
+
+The command (`!mynewclip`) is registered automatically.
 
 ## Setup
 
@@ -42,6 +59,12 @@ commit the real `.env` (it is git- and docker-ignored).
 ### 3a. Run with Docker (recommended)
 
 ```bash
+docker compose up -d --build
+```
+
+Or without compose:
+
+```bash
 docker build -t skill-issue-bot .
 docker run --env-file .env skill-issue-bot
 ```
@@ -56,20 +79,25 @@ pip install -r requirements.txt
 python app.py
 ```
 
-## Tests
+## Tests and linting
 
 ```bash
 python -m unittest -v
+pip install ruff && ruff check .
 ```
 
 The unit tests mock `discord.py`, `yt-dlp`, and `python-dotenv`, so they run
-without any dependencies installed. CI runs them on every push and PR, and
-also verifies the Docker image builds.
+without any dependencies installed. CI runs the tests, `ruff`, and a Docker
+image build on every push and PR, and Dependabot keeps dependencies fresh.
 
 ## Operational notes
 
 - **Keep `yt-dlp` fresh.** YouTube changes constantly; if clips stop playing
   with extraction errors, rebuild the image (or `pip install -U yt-dlp`) to
-  pick up the latest release.
-- The bot plays one clip at a time per server: triggering a new clip while one
-  is playing interrupts it.
+  pick up the latest release. Dependabot opens weekly bump PRs for this.
+- The bot shuts down cleanly on SIGTERM (`docker stop`, platform redeploys),
+  disconnecting from voice before exiting.
+
+## License
+
+[MIT](LICENSE)
