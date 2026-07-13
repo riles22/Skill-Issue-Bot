@@ -11,5 +11,6 @@ compose.yaml
 LICENSE
 README.md
 test_bot_logic.py
+requirements-dev.txt
 venv
 .venv

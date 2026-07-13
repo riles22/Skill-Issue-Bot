@@ -38,9 +38,9 @@ commands_mock.cooldown.side_effect = side_effect_decorator
 commands_mock.CommandNotFound = type('CommandNotFound', (Exception,), {})
 commands_mock.CommandOnCooldown = type('CommandOnCooldown', (Exception,), {})
 
-# Now we can import the app logic, with a fake token in place.
-with patch('os.getenv', return_value='FAKE_TOKEN'):
-    import app
+# Importing app needs no token (DISCORD_TOKEN is only checked in _main),
+# but it must happen after the sys.modules mocks above — hence the noqa.
+import app  # noqa: E402
 
 
 def make_voice_ctx():
@@ -119,9 +119,22 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
 
         await app.play_audio(ctx, "http://youtube.com/video")
 
-        ctx.send.assert_called_with("Error extracting audio: boom")
+        message = ctx.send.call_args.args[0]
+        self.assertIn("Couldn't fetch audio", message)
+        self.assertNotIn("boom", message)  # exception details stay in the logs
         vc.play.assert_not_called()
         vc.disconnect.assert_awaited_once()
+
+    async def test_connect_error_message_hides_details(self):
+        ctx, vc = make_voice_ctx()
+        ctx.author.voice.channel.connect.side_effect = RuntimeError("http://internal.url")
+
+        await app.play_audio(ctx, "http://youtube.com/video")
+
+        message = ctx.send.call_args.args[0]
+        self.assertIn("Couldn't connect", message)
+        self.assertNotIn("internal.url", message)
+        vc.play.assert_not_called()
 
     async def test_interrupting_a_clip_does_not_disconnect(self):
         ctx, vc = make_voice_ctx()
@@ -202,7 +215,47 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
 
         await app.on_command_error(ctx, RuntimeError("kaboom"))
 
-        ctx.send.assert_called_with("Something went wrong: kaboom")
+        message = ctx.send.call_args.args[0]
+        self.assertIn("Something went wrong", message)
+        self.assertNotIn("kaboom", message)  # exception details stay in the logs
+
+    async def test_guild_removal_drops_per_guild_state(self):
+        # Touch the defaultdicts the way a play command would
+        _ = app._play_locks[1234]
+        app._play_generation[1234] += 1
+        guild = MagicMock()
+        guild.id = 1234
+
+        await app.on_guild_remove(guild)
+
+        self.assertNotIn(1234, app._play_locks)
+        self.assertNotIn(1234, app._play_generation)
+
+    async def test_main_exits_without_token(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('DISCORD_TOKEN', None)
+            with self.assertRaises(SystemExit):
+                await app._main()
+
+    async def test_heartbeat_touches_file_while_ready(self):
+        app.bot.is_closed = MagicMock(side_effect=[False, True])
+        app.bot.is_ready = MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'healthy')
+
+            await app._heartbeat(path, interval=0)
+
+            self.assertTrue(os.path.isfile(path))
+
+    async def test_heartbeat_skips_file_when_not_ready(self):
+        app.bot.is_closed = MagicMock(side_effect=[False, True])
+        app.bot.is_ready = MagicMock(return_value=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'healthy')
+
+            await app._heartbeat(path, interval=0)
+
+            self.assertFalse(os.path.exists(path))
 
     async def test_disconnects_when_left_alone(self):
         member = MagicMock()

@@ -109,7 +109,7 @@ PaaS tiers that sleep on idle (Render, Koyeb, Replit). The genuinely free
 paths are a free cloud VM or spare hardware at home.
 
 On any host with Docker, running it is one command (the image is published
-for both x86 and ARM on every push to `main`):
+for both x86 and ARM on every push to `main`, but only after CI passes):
 
 ```bash
 docker run -d --name skill-issue-bot --restart unless-stopped \
@@ -163,12 +163,40 @@ year.
 
 ```bash
 python -m unittest -v
-pip install ruff && ruff check .
+pip install -r requirements-dev.txt && ruff check .
 ```
 
 The unit tests mock `discord.py`, `yt-dlp`, and `python-dotenv`, so they run
 without any dependencies installed. CI runs the tests, `ruff`, and a Docker
 image build on every push and PR, and Dependabot keeps dependencies fresh.
+Pushes to `main` (and `v*` release tags) additionally publish the GHCR image
+— but only after all of those checks pass and the built image clears a Trivy
+vulnerability scan. Release tags (`git tag v1.0.0 && git push --tags`) also
+publish semver image tags (`:1.0.0`, `:1.0`) alongside `:latest`.
+
+Runtime dependencies are locked in `constraints.txt`, so CI and the Docker
+image install the exact same tested set. To refresh the lock after editing
+`requirements.txt`:
+
+```bash
+uv pip compile requirements.txt --python-version 3.12 -o constraints.txt
+```
+
+### Manual smoke test
+
+CI cannot exercise real Discord voice (the unit tests mock it), so before
+merging changes that touch playback — and before tagging a release — run the
+bot against a real server once and check:
+
+1. `!skill` / `!ded` — YouTube extraction still works
+2. `!airhorn` — DCA playback works
+3. `!anotha` — chained playback (DJ Khaled followed by an airhorn)
+4. Interrupting a playing clip with another command
+5. Moving the bot between voice channels mid-clip
+6. Leaving the bot alone with only other bots (it should disconnect)
+7. `docker stop` during playback (clean voice disconnect, no zombie session)
+8. The published multi-arch image on the intended host (`docker ps` should
+   report the container healthy once the bot is connected)
 
 ## Operational notes
 
@@ -177,6 +205,14 @@ image build on every push and PR, and Dependabot keeps dependencies fresh.
   pick up the latest release. Dependabot opens weekly bump PRs for this.
 - The bot shuts down cleanly on SIGTERM (`docker stop`, platform redeploys),
   disconnecting from voice before exiting.
+- **The container health check tracks the Discord connection, not the
+  process.** While connected, the bot touches the file named by
+  `HEALTH_FILE` every 30 seconds; the Docker `HEALTHCHECK` fails once that
+  file goes stale. So `docker ps` reporting `unhealthy` means "running but
+  not connected to Discord" — check the token and the logs. Outside Docker,
+  set `HEALTH_FILE` yourself or leave it unset to disable the heartbeat.
+- Error replies in Discord are deliberately generic; the full exception and
+  traceback are always in the container logs (`docker logs skill-issue-bot`).
 
 ## License
 

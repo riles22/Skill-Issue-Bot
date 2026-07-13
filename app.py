@@ -3,19 +3,13 @@ import logging
 import os
 import random
 import signal
+import time
 from collections import defaultdict
 
 import discord
 from discord.ext import commands
 import yt_dlp
 from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-
-if not TOKEN:
-    raise ValueError("No DISCORD_TOKEN found in environment variables.")
 
 log = logging.getLogger(__name__)
 
@@ -258,9 +252,11 @@ async def _connect_to_caller(ctx):
         if vc.channel != channel:
             await vc.move_to(channel)
         return vc
-    except Exception as e:
+    except Exception:
+        # Exception text can leak URLs/paths/library internals; log it, but
+        # keep the chat message stable.
         log.exception('Failed to connect to voice channel')
-        await ctx.send(f"Failed to connect to voice channel: {e}")
+        await ctx.send("Couldn't connect to the voice channel. Check the bot logs for details.")
         return None
 
 
@@ -303,9 +299,9 @@ async def play_audio(ctx, url):
                 info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
             audio_url = info.get('url')
             title = info.get('title', 'Unknown Title')
-        except Exception as e:
+        except Exception:
             log.exception('Error extracting audio')
-            await ctx.send(f"Error extracting audio: {e}")
+            await ctx.send("Couldn't fetch audio for that clip. Check the bot logs for details.")
             if not vc.is_playing():
                 await vc.disconnect()
             return
@@ -326,9 +322,9 @@ async def play_audio(ctx, url):
         try:
             source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTS)
             vc.play(source, after=_make_after_playing(vc, guild_id, generation))
-        except Exception as e:
+        except Exception:
             log.exception('Error playing audio')
-            await ctx.send(f"Error playing audio: {e}")
+            await ctx.send("Couldn't start playback. Check the bot logs for details.")
             if not vc.is_playing():
                 await vc.disconnect()
             return
@@ -357,9 +353,9 @@ async def play_local(ctx, paths):
         # Like the original airhornbot, successful plays are silent in chat
         try:
             vc.play(DCASource(*paths), after=_make_after_playing(vc, guild_id, generation))
-        except Exception as e:
+        except Exception:
             log.exception('Error playing sound')
-            await ctx.send(f"Error playing sound: {e}")
+            await ctx.send("Couldn't play that sound. Check the bot logs for details.")
             if not vc.is_playing():
                 await vc.disconnect()
 
@@ -444,8 +440,8 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(f"Slow down! Try again in {error.retry_after:.1f}s.")
         return
-    log.error('Command %s failed: %s', ctx.command, error)
-    await ctx.send(f"Something went wrong: {error}")
+    log.error('Command %s failed', ctx.command, exc_info=error)
+    await ctx.send("Something went wrong running that command. Check the bot logs for details.")
 
 
 @bot.event
@@ -460,8 +456,46 @@ async def on_voice_state_update(member, before, after):
             await voice_client.disconnect()
 
 
+@bot.event
+async def on_guild_remove(guild):
+    """Drops per-guild playback state when the bot is removed from a guild.
+
+    Removal is the one point where no play command can be mid-flight for the
+    guild, so popping the lock here can't race an active !airhorn.
+    """
+    _play_locks.pop(guild.id, None)
+    _play_generation.pop(guild.id, None)
+
+
+HEARTBEAT_INTERVAL = 30  # seconds
+
+
+async def _heartbeat(path, interval=HEARTBEAT_INTERVAL):
+    """Touches `path` while the bot is connected and ready.
+
+    Lets a container health check verify the Discord connection is actually
+    up — a stale file means "process alive but not connected".
+    """
+    while not bot.is_closed():
+        if bot.is_ready():
+            try:
+                with open(path, 'w') as f:
+                    f.write(f'{time.time()}\n')
+            except OSError:
+                log.warning('Could not write health file %s', path)
+        await asyncio.sleep(interval)
+
+
 async def _main():
     """Runs the bot, shutting down cleanly on SIGINT/SIGTERM."""
+    load_dotenv()
+
+    # Validated here rather than at import so importing the module (tests,
+    # tooling) never requires a token.
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        raise SystemExit("No DISCORD_TOKEN found in environment variables.")
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -470,8 +504,17 @@ async def _main():
             # Signal handlers aren't supported on Windows event loops
             pass
 
-    async with bot:
-        await bot.start(TOKEN)
+    heartbeat_task = None
+    health_file = os.getenv('HEALTH_FILE')
+    if health_file:
+        heartbeat_task = asyncio.create_task(_heartbeat(health_file))
+
+    try:
+        async with bot:
+            await bot.start(token)
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
 
 
 if __name__ == "__main__":
