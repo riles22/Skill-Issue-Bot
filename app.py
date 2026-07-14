@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import random
@@ -17,7 +18,11 @@ log = logging.getLogger(__name__)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+# Upstream text (YouTube video titles) is echoed into chat, so suppress all
+# mentions bot-wide: a title containing @everyone or a user/role mention
+# renders as plain text instead of pinging anyone.
+bot = commands.Bot(command_prefix='!', intents=intents,
+                   allowed_mentions=discord.AllowedMentions.none())
 
 # YouTube soundboard clips: each entry becomes a bot command (e.g. !skill)
 CLIPS = {
@@ -214,10 +219,31 @@ _play_locks = defaultdict(asyncio.Lock)
 _play_generation = defaultdict(int)
 
 
+# Tracks whether the gateway websocket is currently up. is_ready() alone
+# can't drive the health heartbeat: discord.py leaves it set while the client
+# is disconnected and auto-reconnecting, so a long Discord outage would
+# otherwise still look healthy.
+_gateway_connected = False
+
+
 @bot.event
 async def on_ready():
+    global _gateway_connected
+    _gateway_connected = True
     log.info('%s has connected to Discord!', bot.user)
     _check_sound_files()
+
+
+@bot.event
+async def on_resumed():
+    global _gateway_connected
+    _gateway_connected = True
+
+
+@bot.event
+async def on_disconnect():
+    global _gateway_connected
+    _gateway_connected = False
 
 
 def _check_sound_files():
@@ -474,10 +500,13 @@ async def _heartbeat(path, interval=HEARTBEAT_INTERVAL):
     """Touches `path` while the bot is connected and ready.
 
     Lets a container health check verify the Discord connection is actually
-    up — a stale file means "process alive but not connected".
+    up — a stale file means "process alive but not connected". The gateway
+    flag matters: during an outage the client auto-reconnects with
+    is_ready() still set, and the heartbeat must pause until the connection
+    is really back.
     """
     while not bot.is_closed():
-        if bot.is_ready():
+        if bot.is_ready() and _gateway_connected:
             try:
                 with open(path, 'w') as f:
                     f.write(f'{time.time()}\n')
@@ -515,6 +544,9 @@ async def _main():
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
+            # Await the cancellation so shutdown never leaves a pending task
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
 
 
 if __name__ == "__main__":

@@ -24,12 +24,16 @@ COPY . .
 RUN useradd --create-home appuser
 USER appuser
 
-# The bot touches this file every 30s while its Discord connection is up
-# (see _heartbeat in app.py); a stale file fails the health check, so
+# The bot touches this file every 30s while its Discord gateway connection is
+# up (see _heartbeat in app.py); a stale file fails the health check, so
 # "unhealthy" means "not connected to Discord", not just "process died".
+# Overriding HEALTH_FILE to an empty value disables both the heartbeat and
+# the check (it then always passes). Note that Docker itself only *reports*
+# health — restarting unhealthy containers needs an orchestrator or the
+# autoheal sidecar sketched in compose.yaml.
 ENV HEALTH_FILE=/tmp/skill-issue-bot-healthy
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["python", "-c", "import os, sys, time; sys.exit(0 if time.time() - os.path.getmtime(os.environ['HEALTH_FILE']) < 90 else 1)"]
+    CMD ["python", "-c", "import os, sys, time; p = os.environ.get('HEALTH_FILE'); sys.exit(0 if not p or time.time() - os.path.getmtime(p) < 90 else 1)"]
 
 # Run the bot
 CMD ["python", "app.py"]

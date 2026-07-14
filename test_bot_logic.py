@@ -84,6 +84,14 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
         # Reset per-guild state between tests
         app._play_locks.clear()
         app._play_generation.clear()
+        app._gateway_connected = False
+
+    def test_bot_suppresses_all_mentions(self):
+        # YouTube titles are echoed into chat; a title containing @everyone
+        # must never ping, so the bot is constructed with mentions disabled.
+        kwargs = commands_mock.Bot.call_args.kwargs
+        self.assertIs(kwargs['allowed_mentions'],
+                      sys.modules['discord'].AllowedMentions.none.return_value)
 
     async def test_play_audio_connects_and_plays(self):
         ctx, vc = make_voice_ctx()
@@ -240,6 +248,7 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_touches_file_while_ready(self):
         app.bot.is_closed = MagicMock(side_effect=[False, True])
         app.bot.is_ready = MagicMock(return_value=True)
+        app._gateway_connected = True
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'healthy')
 
@@ -250,12 +259,35 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_skips_file_when_not_ready(self):
         app.bot.is_closed = MagicMock(side_effect=[False, True])
         app.bot.is_ready = MagicMock(return_value=False)
+        app._gateway_connected = True
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'healthy')
 
             await app._heartbeat(path, interval=0)
 
             self.assertFalse(os.path.exists(path))
+
+    async def test_heartbeat_pauses_during_gateway_outage(self):
+        # is_ready() stays set while discord.py auto-reconnects, so the
+        # heartbeat must also require the gateway flag — otherwise a long
+        # Discord outage would still look healthy to the container check.
+        app.bot.is_closed = MagicMock(side_effect=[False, True])
+        app.bot.is_ready = MagicMock(return_value=True)
+        await app.on_disconnect()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'healthy')
+
+            await app._heartbeat(path, interval=0)
+
+            self.assertFalse(os.path.exists(path))
+
+    async def test_gateway_flag_tracks_connection_events(self):
+        await app.on_ready()
+        self.assertTrue(app._gateway_connected)
+        await app.on_disconnect()
+        self.assertFalse(app._gateway_connected)
+        await app.on_resumed()
+        self.assertTrue(app._gateway_connected)
 
     async def test_disconnects_when_left_alone(self):
         member = MagicMock()

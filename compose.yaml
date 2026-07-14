@@ -3,3 +3,18 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
+    # Marks the container for the optional autoheal sidecar below.
+    labels:
+      - autoheal=true
+
+  # Docker's restart policy only reacts to the process exiting — a container
+  # that merely turns "unhealthy" (process up but not connected to Discord,
+  # see HEALTHCHECK in the Dockerfile) is left running. Uncomment this
+  # sidecar to restart the bot automatically when that happens.
+  # autoheal:
+  #   image: willfarrell/autoheal:1.2.0
+  #   restart: unless-stopped
+  #   environment:
+  #     AUTOHEAL_CONTAINER_LABEL: autoheal
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock

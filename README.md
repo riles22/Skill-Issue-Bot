@@ -170,9 +170,12 @@ The unit tests mock `discord.py`, `yt-dlp`, and `python-dotenv`, so they run
 without any dependencies installed. CI runs the tests, `ruff`, and a Docker
 image build on every push and PR, and Dependabot keeps dependencies fresh.
 Pushes to `main` (and `v*` release tags) additionally publish the GHCR image
-— but only after all of those checks pass and the built image clears a Trivy
-vulnerability scan. Release tags (`git tag v1.0.0 && git push --tags`) also
-publish semver image tags (`:1.0.0`, `:1.0`) alongside `:latest`.
+— but only after all of those checks pass. The multi-arch image is pushed
+once under a `candidate-<sha>` tag, both platform digests are Trivy-scanned
+*as pushed*, and only then are `:latest` (and friends) pointed at that exact
+digest — so the scanned bytes are precisely the bytes users pull. Release
+tags (`git tag v1.0.0 && git push --tags`) also publish semver image tags
+(`:1.0.0`, `:1.0`) alongside `:latest`.
 
 Runtime dependencies are locked in `constraints.txt`, so CI and the Docker
 image install the exact same tested set. To refresh the lock after editing
@@ -208,9 +211,16 @@ bot against a real server once and check:
 - **The container health check tracks the Discord connection, not the
   process.** While connected, the bot touches the file named by
   `HEALTH_FILE` every 30 seconds; the Docker `HEALTHCHECK` fails once that
-  file goes stale. So `docker ps` reporting `unhealthy` means "running but
-  not connected to Discord" — check the token and the logs. Outside Docker,
-  set `HEALTH_FILE` yourself or leave it unset to disable the heartbeat.
+  file goes stale. The heartbeat pauses whenever the gateway websocket
+  drops, so an extended Discord outage (or a bot stuck reconnecting) also
+  turns the container `unhealthy` — not just a bad token at startup. Check
+  the token and the logs. Outside Docker, set `HEALTH_FILE` yourself or
+  leave it unset to disable the heartbeat.
+- **Docker does not restart unhealthy containers on its own.** `--restart
+  unless-stopped` only reacts to the process exiting; a running-but-unhealthy
+  container just sits there flagged in `docker ps`. If you want automatic
+  recovery, uncomment the `autoheal` sidecar in `compose.yaml` (or use any
+  orchestrator/watchdog that acts on Docker health status).
 - Error replies in Discord are deliberately generic; the full exception and
   traceback are always in the container logs (`docker logs skill-issue-bot`).
 
