@@ -1,4 +1,16 @@
 __pycache__
+*.pyc
 .env
+.env.example
 .git
 .gitignore
+.github
+.dockerignore
+Dockerfile
+compose.yaml
+LICENSE
+README.md
+test_bot_logic.py
+requirements-dev.txt
+venv
+.venv

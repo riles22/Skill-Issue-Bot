@@ -1,0 +1,3 @@
+# Dev/CI tooling; runtime dependencies live in requirements.txt (pinned by
+# constraints.txt). Dependabot bumps this weekly like the rest.
+ruff==0.15.21
