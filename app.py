@@ -5,6 +5,7 @@ import random
 import signal
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import discord
 from discord.ext import commands
@@ -30,12 +31,19 @@ YDL_OPTS = {
     'format': 'bestaudio/best',
     'noplaylist': True,
     'quiet': True,
+    # Bounds each network operation; EXTRACT_TIMEOUT caps the job as a whole
+    'socket_timeout': 10,
+    'retries': 2,
     'extractor_args': {
         'youtube': {
             'player_client': ['default']
         }
     }
 }
+
+# Outer deadline on a whole extraction: yt-dlp makes many network calls, so
+# socket_timeout alone doesn't bound a long series of slow-but-successful ones
+EXTRACT_TIMEOUT = 30  # seconds
 
 # Reconnect flags keep the stream alive if YouTube drops the connection mid-clip
 FFMPEG_OPTS = {
@@ -207,10 +215,12 @@ def _pick_sound(collection):
     return random.choices(names, weights=weights)[0]
 
 
-# Per-guild state: the lock serializes plays within a guild, and the generation
-# counter lets the after-play callback tell "clip finished" apart from "clip
-# was interrupted by a newer one".
+# Per-guild state: the lock serializes plays within a guild, the request
+# counter orders plays by command arrival (so a slow extraction can't stomp a
+# newer clip), and the generation counter lets the after-play callback tell
+# "clip finished" apart from "clip was interrupted by a newer one".
 _play_locks = defaultdict(asyncio.Lock)
+_play_requests = defaultdict(int)
 _play_generation = defaultdict(int)
 
 
@@ -271,6 +281,27 @@ def _make_after_playing(vc, guild_id, generation):
     return after_playing
 
 
+# Extractions get their own small pool: a deadline-abandoned extraction keeps
+# its thread busy until yt-dlp gives up, and those zombies must not starve the
+# event loop's default executor (which discord.py and the rest of the app use).
+_extract_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='yt-extract')
+
+
+async def _extract_audio(url):
+    """Resolves stream info for a YouTube URL in a worker thread.
+
+    Raises asyncio.TimeoutError after EXTRACT_TIMEOUT. The worker thread
+    can't be killed and runs to completion, but nothing waits on it.
+    """
+    def extract():
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(_extract_pool, extract), EXTRACT_TIMEOUT)
+
+
 async def play_audio(ctx, url):
     """Joins voice and plays audio streamed from a YouTube URL."""
     if not await _ready_to_play(ctx):
@@ -278,7 +309,45 @@ async def play_audio(ctx, url):
 
     guild_id = ctx.guild.id
 
+    # Claim a request slot before extracting so plays keep command-arrival
+    # order even though extraction times vary wildly.
+    _play_requests[guild_id] += 1
+    request = _play_requests[guild_id]
+
+    # Extraction runs before taking the guild's playback lock: it's the slow,
+    # network-bound step, and a hung extraction must not wedge every later
+    # play in the guild. It also runs before joining voice, so a failed
+    # extraction never yanks the bot into (and back out of) a channel.
+    try:
+        info = await _extract_audio(url)
+    except (TimeoutError, asyncio.TimeoutError):
+        log.error('Timed out extracting audio from %s', url)
+        await ctx.send("Timed out fetching audio for that clip. Try again in a moment.")
+        return
+    except Exception:
+        log.exception('Error extracting audio')
+        await ctx.send("Couldn't fetch audio for that clip. Check the bot logs for details.")
+        return
+
+    audio_url = info.get('url')
+    title = info.get('title', 'Unknown Title')
+    if not audio_url:
+        await ctx.send("Could not find a playable audio stream for that video.")
+        return
+
+    # The caller may have left voice while extraction ran
+    if not ctx.author.voice:
+        await ctx.send("You are not connected to a voice channel.")
+        return
+
     async with _play_locks[guild_id]:
+        # A newer play command claimed the guild while this one was still
+        # extracting; playing now would replace the newer clip with an older
+        # one, so this request is stale and drops silently.
+        if _play_requests[guild_id] != request:
+            log.info('Dropping stale play request for guild %s', guild_id)
+            return
+
         # Claim a new generation: if we interrupt a running clip below, its
         # after-play callback must not disconnect the bot underneath us.
         _play_generation[guild_id] += 1
@@ -291,26 +360,6 @@ async def play_audio(ctx, url):
         # Stop any currently playing audio
         if vc.is_playing():
             vc.stop()
-
-        # Extract the stream URL in a worker thread to avoid blocking the loop
-        try:
-            with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-                loop = asyncio.get_running_loop()
-                info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
-            audio_url = info.get('url')
-            title = info.get('title', 'Unknown Title')
-        except Exception:
-            log.exception('Error extracting audio')
-            await ctx.send("Couldn't fetch audio for that clip. Check the bot logs for details.")
-            if not vc.is_playing():
-                await vc.disconnect()
-            return
-
-        if not audio_url:
-            await ctx.send("Could not find a playable audio stream for that video.")
-            if not vc.is_playing():
-                await vc.disconnect()
-            return
 
         # Check if still connected before playing
         if not vc.is_connected():
@@ -338,6 +387,10 @@ async def play_local(ctx, paths):
         return
 
     guild_id = ctx.guild.id
+
+    # Horns join the same ordering as YouTube clips: claiming a request slot
+    # here lets a still-extracting older clip detect that it has gone stale.
+    _play_requests[guild_id] += 1
 
     async with _play_locks[guild_id]:
         _play_generation[guild_id] += 1
@@ -464,6 +517,7 @@ async def on_guild_remove(guild):
     guild, so popping the lock here can't race an active !airhorn.
     """
     _play_locks.pop(guild.id, None)
+    _play_requests.pop(guild.id, None)
     _play_generation.pop(guild.id, None)
 
 

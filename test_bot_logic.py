@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -83,7 +84,11 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         # Reset per-guild state between tests
         app._play_locks.clear()
+        app._play_requests.clear()
         app._play_generation.clear()
+        # Reset the shared yt_dlp mock so a side_effect configured by one
+        # test can't leak into another (test order must not matter)
+        app.yt_dlp.YoutubeDL.reset_mock(return_value=True, side_effect=True)
 
     async def test_play_audio_connects_and_plays(self):
         ctx, vc = make_voice_ctx()
@@ -113,7 +118,7 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
 
         ctx.send.assert_called_with("This command only works in a server.")
 
-    async def test_play_audio_extraction_error_disconnects(self):
+    async def test_play_audio_extraction_error_never_joins_voice(self):
         ctx, vc = make_voice_ctx()
         configure_extraction(error=RuntimeError("boom"))
 
@@ -122,8 +127,109 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
         message = ctx.send.call_args.args[0]
         self.assertIn("Couldn't fetch audio", message)
         self.assertNotIn("boom", message)  # exception details stay in the logs
+        # Extraction runs before joining voice, so there is nothing to undo
+        ctx.author.voice.channel.connect.assert_not_called()
         vc.play.assert_not_called()
-        vc.disconnect.assert_awaited_once()
+
+    def make_hanging_extraction(self):
+        """Extraction that blocks until the test ends (released via cleanup)."""
+        release = threading.Event()
+        self.addCleanup(release.set)  # frees the worker thread at test end
+        ydl = configure_extraction()
+        ydl.extract_info.side_effect = lambda *a, **k: release.wait(2)
+        return ydl
+
+    async def test_play_audio_extraction_timeout_sends_stable_message(self):
+        ctx, vc = make_voice_ctx()
+        self.make_hanging_extraction()
+
+        with patch.object(app, 'EXTRACT_TIMEOUT', 0.05):
+            await app.play_audio(ctx, "http://youtube.com/video")
+
+        message = ctx.send.call_args.args[0]
+        self.assertIn("Timed out", message)
+        ctx.author.voice.channel.connect.assert_not_called()
+        vc.play.assert_not_called()
+
+    async def test_extraction_error_leaves_current_clip_playing(self):
+        ctx, vc = make_voice_ctx()
+        ctx.voice_client = vc
+        vc.is_playing.return_value = True
+        configure_extraction(error=RuntimeError("boom"))
+
+        await app.play_audio(ctx, "http://youtube.com/video")
+
+        # A failed play must not touch whatever is currently playing
+        vc.stop.assert_not_called()
+        vc.disconnect.assert_not_awaited()
+        self.assertNotIn(ctx.guild.id, app._play_generation)
+
+    async def test_extraction_timeout_leaves_current_clip_playing(self):
+        ctx, vc = make_voice_ctx()
+        ctx.voice_client = vc
+        vc.is_playing.return_value = True
+        self.make_hanging_extraction()
+
+        with patch.object(app, 'EXTRACT_TIMEOUT', 0.05):
+            await app.play_audio(ctx, "http://youtube.com/video")
+
+        vc.stop.assert_not_called()
+        vc.disconnect.assert_not_awaited()
+        self.assertNotIn(ctx.guild.id, app._play_generation)
+
+    async def test_stale_extraction_does_not_interrupt_newer_clip(self):
+        ctx, vc = make_voice_ctx()
+
+        async def slow_extract(url):
+            # A newer play command claims the guild while this extraction runs
+            app._play_requests[ctx.guild.id] += 1
+            return {'url': 'http://audio.url', 'title': 'Old Clip'}
+
+        with patch.object(app, '_extract_audio', slow_extract):
+            await app.play_audio(ctx, "http://youtube.com/video")
+
+        # The stale request drops without joining voice or playing
+        ctx.author.voice.channel.connect.assert_not_called()
+        vc.play.assert_not_called()
+
+    async def test_extraction_runs_outside_the_play_lock(self):
+        ctx, vc = make_voice_ctx()
+        seen = {}
+
+        async def fake_extract(url):
+            seen['locked'] = app._play_locks[ctx.guild.id].locked()
+            return {'url': 'http://audio.url', 'title': 'Test Video'}
+
+        with patch.object(app, '_extract_audio', fake_extract):
+            await app.play_audio(ctx, "http://youtube.com/video")
+
+        # A hung extraction must not hold the guild's lock and wedge it
+        self.assertFalse(seen['locked'])
+        vc.play.assert_called_once()
+
+    async def test_caller_leaving_during_extraction_aborts(self):
+        ctx, vc = make_voice_ctx()
+
+        async def fake_extract(url):
+            ctx.author.voice = None  # caller left while extraction ran
+            return {'url': 'http://audio.url', 'title': 'Test Video'}
+
+        with patch.object(app, '_extract_audio', fake_extract):
+            await app.play_audio(ctx, "http://youtube.com/video")
+
+        ctx.send.assert_called_with("You are not connected to a voice channel.")
+        vc.play.assert_not_called()
+
+    def test_ydl_opts_bound_network_operations(self):
+        # Real, sane bounds — not just key presence
+        socket_timeout = app.YDL_OPTS['socket_timeout']
+        self.assertIsInstance(socket_timeout, (int, float))
+        self.assertGreater(socket_timeout, 0)
+        self.assertLessEqual(socket_timeout, app.EXTRACT_TIMEOUT)
+        retries = app.YDL_OPTS['retries']
+        self.assertIsInstance(retries, int)
+        self.assertGreaterEqual(retries, 0)
+        self.assertLessEqual(retries, 5)
 
     async def test_connect_error_message_hides_details(self):
         ctx, vc = make_voice_ctx()
@@ -291,7 +397,9 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
 class TestAirhorn(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         app._play_locks.clear()
+        app._play_requests.clear()
         app._play_generation.clear()
+        app.yt_dlp.YoutubeDL.reset_mock(return_value=True, side_effect=True)
 
     def test_all_collection_sounds_have_files(self):
         for collection in app.SOUND_COLLECTIONS:
@@ -399,6 +507,19 @@ class TestAirhorn(unittest.IsolatedAsyncioTestCase):
         vc.play.assert_called_once()
         self.assertIsInstance(vc.play.call_args.args[0], app.DCASource)
         ctx.send.assert_not_called()  # successful horn plays are silent
+
+    async def test_play_local_supersedes_pending_extractions(self):
+        ctx, vc = make_voice_ctx()
+        before = app._play_requests[ctx.guild.id]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'horn.dca')
+            with open(path, 'wb') as f:
+                f.write(dca_bytes(b'toot'))
+
+            await app.play_local(ctx, [path])
+
+        # Horns claim a request slot so an in-flight extraction goes stale
+        self.assertEqual(app._play_requests[ctx.guild.id], before + 1)
 
 
 if __name__ == '__main__':

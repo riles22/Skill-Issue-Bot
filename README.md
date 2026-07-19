@@ -203,6 +203,13 @@ bot against a real server once and check:
 - **Keep `yt-dlp` fresh.** YouTube changes constantly; if clips stop playing
   with extraction errors, rebuild the image (or `pip install -U yt-dlp`) to
   pick up the latest release. Dependabot opens weekly bump PRs for this.
+- **YouTube extraction is bounded.** Individual network calls time out after
+  10 seconds (with 2 retries) and a whole extraction is capped at 30 seconds.
+  Extraction runs in its own small thread pool, before the bot joins voice or
+  takes the per-server playback lock, and a play command superseded by a newer
+  one while still extracting is dropped — so a hung or slow YouTube fetch
+  can't wedge a server's playback or cut off a newer clip. Airhorn sounds are
+  unaffected either way (they play from local files).
 - The bot shuts down cleanly on SIGTERM (`docker stop`, platform redeploys),
   disconnecting from voice before exiting.
 - **The container health check tracks the Discord connection, not the
