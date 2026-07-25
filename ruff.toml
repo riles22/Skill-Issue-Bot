@@ -1,0 +1,22 @@
+# Ruff's defaults are only pyflakes plus a few pycodestyle errors. This widens
+# that to the checks that have actually caught things in this codebase's shape:
+# import hygiene, likely-bug patterns, and dead comprehension/loop constructs.
+target-version = "py310"  # the floor the README promises and CI verifies
+line-length = 100
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # flake8-bugbear (mutable defaults, loop-variable capture, ...)
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade (keep syntax at the 3.10 floor, not older)
+    "RET",  # flake8-return
+]
+
+[lint.per-file-ignores]
+# The mocks in sys.modules have to be in place before `import app`, so the
+# import cannot move to the top of the file.
+"test_bot_logic.py" = ["E402"]

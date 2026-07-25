@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR makes the in-flight run pointless. Pushes to main keep
+# running, because each one can publish an image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,6 +30,24 @@ jobs:
         run: pip install -r requirements.txt -c constraints.txt
       - name: Run tests
         run: python -m unittest -v
+
+  # The image ships 3.12, but the README promises 3.10+ for local runs. The
+  # suite mocks discord.py/yt-dlp/dotenv, so it runs with nothing installed —
+  # which is exactly what makes it a cheap check of the language floor,
+  # independent of whether constraints.txt resolves on an older interpreter.
+  compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run tests without runtime dependencies
+        run: python -m unittest
 
   lint:
     runs-on: ubuntu-latest
@@ -48,7 +72,7 @@ jobs:
   # has passed — a broken push must never replace :latest.
   publish:
     if: github.event_name == 'push'
-    needs: [test, lint, docker]
+    needs: [test, compat, lint, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: read

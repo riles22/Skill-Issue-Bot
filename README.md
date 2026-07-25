@@ -36,8 +36,10 @@ the original; add a sound name to pick one (e.g. `!airhorn truck`). Sounds are
 the original pre-encoded Opus `.dca` files played natively — no ffmpeg or
 re-encoding involved (see [sounds/README.md](sounds/README.md) for credits).
 
-All play commands share a short per-server cooldown (one play per 3 seconds),
-and triggering a new clip while one is playing interrupts it.
+Every command shares a short per-server cooldown (one per 3 seconds), and
+triggering a new clip while one is playing interrupts it. The bot joins
+deafened — it only ever speaks — and nothing it posts can ping a user, a role,
+or `@everyone`, so a clip title is never able to notify a server.
 
 ### Adding a clip
 
@@ -113,9 +115,13 @@ for both x86 and ARM on every push to `main`, but only after CI passes):
 
 ```bash
 docker run -d --name skill-issue-bot --restart unless-stopped \
+  --log-opt max-size=10m --log-opt max-file=3 \
   -e DISCORD_TOKEN=your-token-here \
   ghcr.io/riles22/skill-issue-bot:latest
 ```
+
+(The `--log-opt` flags keep months of logs from filling a small disk; compose
+does this for you.)
 
 Or clone the repo and use compose:
 
@@ -167,12 +173,16 @@ pip install -r requirements-dev.txt && ruff check .
 ```
 
 The unit tests mock `discord.py`, `yt-dlp`, and `python-dotenv`, so they run
-without any dependencies installed. CI runs the tests, `ruff`, and a Docker
-image build on every push and PR, and Dependabot keeps dependencies fresh.
-Pushes to `main` (and `v*` release tags) additionally publish the GHCR image
-— but only after all of those checks pass and the built image clears a Trivy
-vulnerability scan. Release tags (`git tag v1.0.0 && git push --tags`) also
-publish semver image tags (`:1.0.0`, `:1.0`) alongside `:latest`.
+without any dependencies installed. Lint rules live in `ruff.toml`.
+
+CI runs, on every push and PR: the tests against the exact pinned dependency
+set the image ships, the same tests on Python 3.10/3.11/3.13 (dependency-free,
+which is what makes the "Python 3.10+" claim above a checked one rather than a
+hopeful one), `ruff`, and a Docker image build. Dependabot keeps dependencies
+fresh. Pushes to `main` (and `v*` release tags) additionally publish the GHCR
+image — but only after all of those checks pass and the built image clears a
+Trivy vulnerability scan. Release tags (`git tag v1.0.0 && git push --tags`)
+also publish semver image tags (`:1.0.0`, `:1.0`) alongside `:latest`.
 
 Runtime dependencies are locked in `constraints.txt`, so CI and the Docker
 image install the exact same tested set. To refresh the lock after editing
@@ -194,9 +204,12 @@ bot against a real server once and check:
 4. Interrupting a playing clip with another command
 5. Moving the bot between voice channels mid-clip
 6. Leaving the bot alone with only other bots (it should disconnect)
-7. `docker stop` during playback (clean voice disconnect, no zombie session)
-8. The published multi-arch image on the intended host (`docker ps` should
-   report the container healthy once the bot is connected)
+7. `!leave` while a clip is playing
+8. Leaving the voice channel yourself while a clip is playing, then running
+   another command (it should say you are not connected, not error out)
+9. `docker stop` during playback (clean voice disconnect, no zombie session)
+10. The published multi-arch image on the intended host (`docker ps` should
+    report the container healthy once the bot is connected)
 
 ## Operational notes
 
@@ -211,7 +224,19 @@ bot against a real server once and check:
   can't wedge a server's playback or cut off a newer clip. Airhorn sounds are
   unaffected either way (they play from local files).
 - The bot shuts down cleanly on SIGTERM (`docker stop`, platform redeploys),
-  disconnecting from voice before exiting.
+  disconnecting from voice before exiting. Queued YouTube extractions are
+  dropped at that point; one already in flight still has to finish, but
+  yt-dlp's socket timeout and retry limit bound how long that takes.
+- **A rejected token fails loudly and readably.** A wrong or revoked
+  `DISCORD_TOKEN` exits with a one-line message naming the cause instead of a
+  `LoginFailure` traceback.
+- **A missing sound file is reported, not mimed.** Configured sounds are
+  checked against `sounds/` at startup (a warning lists any that are absent),
+  and a horn command whose file is missing says so in chat rather than
+  joining the channel to play silence.
+- `compose.yaml` caps container logs at 3 × 10 MB. If you run the image with
+  a bare `docker run` on a long-lived host, pass `--log-opt max-size=10m
+  --log-opt max-file=3` yourself — the default json-file driver never rotates.
 - **The container health check tracks the Discord connection, not the
   process.** While connected, the bot touches the file named by
   `HEALTH_FILE` every 30 seconds; the Docker `HEALTHCHECK` fails once that

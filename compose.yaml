@@ -1,5 +1,13 @@
 services:
   bot:
     build: .
+    image: skill-issue-bot
     env_file: .env
     restart: unless-stopped
+    # This runs for months at a time on small hosts; without a cap the JSON
+    # log file grows until it fills the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
