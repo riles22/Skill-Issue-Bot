@@ -12,5 +12,6 @@ LICENSE
 README.md
 test_bot_logic.py
 requirements-dev.txt
+ruff.toml
 venv
 .venv

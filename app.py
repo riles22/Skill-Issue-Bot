@@ -8,8 +8,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import discord
-from discord.ext import commands
 import yt_dlp
+from discord.ext import commands
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
@@ -18,7 +18,14 @@ log = logging.getLogger(__name__)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    # Nothing this bot says should ever ping anyone. Clip titles come from
+    # YouTube, so without this a video named "@everyone" would notify a whole
+    # server every time someone ran the command.
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
 # YouTube soundboard clips: each entry becomes a bot command (e.g. !skill)
 CLIPS = {
@@ -44,6 +51,11 @@ YDL_OPTS = {
 # Outer deadline on a whole extraction: yt-dlp makes many network calls, so
 # socket_timeout alone doesn't bound a long series of slow-but-successful ones
 EXTRACT_TIMEOUT = 30  # seconds
+
+# Joining/moving voice happens while holding a guild's playback lock, so it
+# needs a tighter bound than discord.py's 30s default: a wedged connect would
+# otherwise block every other play command in that server for half a minute.
+VOICE_CONNECT_TIMEOUT = 15  # seconds
 
 # Reconnect flags keep the stream alive if YouTube drops the connection mid-clip
 FFMPEG_OPTS = {
@@ -227,10 +239,10 @@ _play_generation = defaultdict(int)
 @bot.event
 async def on_ready():
     log.info('%s has connected to Discord!', bot.user)
-    _check_sound_files()
 
 
 def _check_sound_files():
+    """Returns the names of configured sounds that have no file on disk."""
     missing = []
     for collection in SOUND_COLLECTIONS:
         for name in collection['sounds']:
@@ -239,34 +251,64 @@ def _check_sound_files():
     if missing:
         log.warning('Missing %d sound file(s) in %s: %s',
                     len(missing), SOUNDS_DIR, ', '.join(missing))
+    return missing
+
+
+async def _reply(ctx, message):
+    """Sends a chat message, tolerating a channel the bot can't post in.
+
+    Every reply here is advisory. If the bot is missing Send Messages (or
+    Discord is having a bad day), that must not turn into an unhandled error
+    on top of whatever we were already reporting.
+    """
+    try:
+        await ctx.send(message)
+    except discord.HTTPException:
+        log.warning('Could not send a reply in guild %s: %s',
+                    getattr(ctx.guild, 'id', None), message)
+
+
+def _caller_channel(ctx):
+    """The voice channel the command's author is in, or None."""
+    voice = getattr(ctx.author, 'voice', None)
+    return voice.channel if voice is not None else None
 
 
 async def _ready_to_play(ctx):
     """Guards shared by all play commands. Returns False if we can't play."""
     if ctx.guild is None:
-        await ctx.send("This command only works in a server.")
+        await _reply(ctx, "This command only works in a server.")
         return False
-    if not ctx.author.voice:
-        await ctx.send("You are not connected to a voice channel.")
+    if _caller_channel(ctx) is None:
+        await _reply(ctx, "You are not connected to a voice channel.")
         return False
     return True
 
 
 async def _connect_to_caller(ctx):
     """Joins or moves to the caller's channel. Returns None if it failed."""
-    channel = ctx.author.voice.channel
+    # Re-read the caller's channel instead of trusting the earlier guard: this
+    # runs under the guild's play lock, so the caller may have left voice while
+    # an older clip was still playing.
+    channel = _caller_channel(ctx)
+    if channel is None:
+        await _reply(ctx, "You are not connected to a voice channel.")
+        return None
     try:
         if ctx.voice_client is None:
-            return await channel.connect()
+            # self_deaf because the bot only ever speaks — a deafened client
+            # isn't sent anyone else's audio.
+            return await channel.connect(
+                timeout=VOICE_CONNECT_TIMEOUT, self_deaf=True)
         vc = ctx.voice_client
         if vc.channel != channel:
-            await vc.move_to(channel)
+            await vc.move_to(channel, timeout=VOICE_CONNECT_TIMEOUT)
         return vc
     except Exception:
         # Exception text can leak URLs/paths/library internals; log it, but
         # keep the chat message stable.
         log.exception('Failed to connect to voice channel')
-        await ctx.send("Couldn't connect to the voice channel. Check the bot logs for details.")
+        await _reply(ctx, "Couldn't connect to the voice channel. Check the bot logs for details.")
         return None
 
 
@@ -276,8 +318,17 @@ def _make_after_playing(vc, guild_id, generation):
         if error:
             log.error('Player error: %s', error)
         # Only disconnect if no newer clip has taken over the connection.
-        if _play_generation[guild_id] == generation:
-            asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
+        if _play_generation[guild_id] != generation:
+            return
+        coro = vc.disconnect()
+        try:
+            asyncio.run_coroutine_threadsafe(coro, bot.loop)
+        except RuntimeError:
+            # This runs on the audio thread, which can outlive the event loop
+            # during shutdown. The loop closing already tore the voice
+            # connection down, so there is nothing left to disconnect.
+            coro.close()
+            log.debug('Event loop closed before disconnecting guild %s', guild_id)
     return after_playing
 
 
@@ -322,22 +373,23 @@ async def play_audio(ctx, url):
         info = await _extract_audio(url)
     except (TimeoutError, asyncio.TimeoutError):
         log.error('Timed out extracting audio from %s', url)
-        await ctx.send("Timed out fetching audio for that clip. Try again in a moment.")
+        await _reply(ctx, "Timed out fetching audio for that clip. Try again in a moment.")
         return
     except Exception:
         log.exception('Error extracting audio')
-        await ctx.send("Couldn't fetch audio for that clip. Check the bot logs for details.")
+        await _reply(ctx, "Couldn't fetch audio for that clip. Check the bot logs for details.")
         return
 
     audio_url = info.get('url')
-    title = info.get('title', 'Unknown Title')
+    # `or` rather than a dict default: yt-dlp can hand back an explicit None
+    title = info.get('title') or 'Unknown Title'
     if not audio_url:
-        await ctx.send("Could not find a playable audio stream for that video.")
+        await _reply(ctx, "Could not find a playable audio stream for that video.")
         return
 
     # The caller may have left voice while extraction ran
-    if not ctx.author.voice:
-        await ctx.send("You are not connected to a voice channel.")
+    if _caller_channel(ctx) is None:
+        await _reply(ctx, "You are not connected to a voice channel.")
         return
 
     async with _play_locks[guild_id]:
@@ -363,7 +415,7 @@ async def play_audio(ctx, url):
 
         # Check if still connected before playing
         if not vc.is_connected():
-            await ctx.send("Bot is not connected to a voice channel.")
+            await _reply(ctx, "Bot is not connected to a voice channel.")
             return
 
         # Play the audio
@@ -373,12 +425,12 @@ async def play_audio(ctx, url):
             vc.play(source, after=_make_after_playing(vc, guild_id, generation))
         except Exception:
             log.exception('Error playing audio')
-            await ctx.send("Couldn't start playback. Check the bot logs for details.")
+            await _reply(ctx, "Couldn't start playback. Check the bot logs for details.")
             if not vc.is_playing():
                 await vc.disconnect()
             return
 
-        await ctx.send(f"Playing: {title}")
+        await _reply(ctx, f"Playing: {title}")
 
 
 async def play_local(ctx, paths):
@@ -403,12 +455,16 @@ async def play_local(ctx, paths):
         if vc.is_playing():
             vc.stop()
 
+        if not vc.is_connected():
+            await _reply(ctx, "Bot is not connected to a voice channel.")
+            return
+
         # Like the original airhornbot, successful plays are silent in chat
         try:
             vc.play(DCASource(*paths), after=_make_after_playing(vc, guild_id, generation))
         except Exception:
             log.exception('Error playing sound')
-            await ctx.send("Couldn't play that sound. Check the bot logs for details.")
+            await _reply(ctx, "Couldn't play that sound. Check the bot logs for details.")
             if not vc.is_playing():
                 await vc.disconnect()
 
@@ -419,7 +475,7 @@ async def play_horn(ctx, collection, sound_name=None):
         sound_name = sound_name.lower()
         if sound_name not in collection['sounds']:
             options = ' '.join(f'`{name}`' for name in collection['sounds'])
-            await ctx.send(f"Unknown sound. Try one of: {options}")
+            await _reply(ctx, f"Unknown sound. Try one of: {options}")
             return
         name = sound_name
     else:
@@ -432,7 +488,19 @@ async def play_horn(ctx, collection, sound_name=None):
     if chained:
         paths.append(_sound_path(chained, _pick_sound(chained)))
 
-    await play_local(ctx, paths)
+    # A sound file missing from the deployment would otherwise make the bot
+    # join, play silence and leave. Skip what isn't there, and say so if that
+    # leaves nothing to play.
+    playable = [path for path in paths if os.path.isfile(path)]
+    if len(playable) != len(paths):
+        log.error('Missing sound file(s): %s', ', '.join(
+            os.path.basename(path) for path in paths if path not in playable))
+    if not playable:
+        await _reply(ctx, "That sound is missing from this deployment. "
+                          "Check the bot logs for details.")
+        return
+
+    await play_local(ctx, playable)
 
 
 def _make_clip_command(name, url):
@@ -465,24 +533,30 @@ for _collection in SOUND_COLLECTIONS:
 
 
 @bot.command(name='clips', aliases=['sounds'])
+@commands.cooldown(1, 3, commands.BucketType.guild)
 async def clips(ctx):
     """Lists the available clips and airhorn commands."""
     clip_names = ' '.join(f'`!{name}`' for name in sorted(CLIPS))
     horn_names = ' '.join(f"`!{c['commands'][0]}`" for c in SOUND_COLLECTIONS)
-    await ctx.send(
+    await _reply(
+        ctx,
         f"Clips: {clip_names}\n"
-        f"Airhorns: {horn_names} — add a sound name to pick one, e.g. `!airhorn truck`."
+        f"Airhorns: {horn_names} — add a sound name to pick one, e.g. `!airhorn truck`.\n"
+        f"`!help` lists every alias and `!leave` kicks me out of voice."
     )
 
 
 @bot.command(name='leave')
+# Same cooldown as the play commands: !leave is the one way to make the bot
+# drop a voice connection on demand, so it needs the same anti-churn guard.
+@commands.cooldown(1, 3, commands.BucketType.guild)
 async def leave(ctx):
     """Disconnects the bot from the voice channel."""
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
-        await ctx.send("Disconnected.")
+        await _reply(ctx, "Disconnected.")
     else:
-        await ctx.send("I am not in a voice channel.")
+        await _reply(ctx, "I am not in a voice channel.")
 
 
 @bot.event
@@ -491,10 +565,10 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"Slow down! Try again in {error.retry_after:.1f}s.")
+        await _reply(ctx, f"Slow down! Try again in {error.retry_after:.1f}s.")
         return
     log.error('Command %s failed', ctx.command, exc_info=error)
-    await ctx.send("Something went wrong running that command. Check the bot logs for details.")
+    await _reply(ctx, "Something went wrong running that command. Check the bot logs for details.")
 
 
 @bot.event
@@ -505,7 +579,11 @@ async def on_voice_state_update(member, before, after):
 
     voice_client = member.guild.voice_client
     if voice_client and voice_client.channel:
-        if all(m.bot for m in voice_client.channel.members):
+        members = voice_client.channel.members
+        # The `members and` guard matters: this list is built from the member
+        # cache, and an empty one would otherwise read as "everyone left" and
+        # cut a clip short. The bot itself is always in there for real.
+        if members and all(m.bot for m in members):
             await voice_client.disconnect()
 
 
@@ -550,10 +628,23 @@ async def _main():
     if not token:
         raise SystemExit("No DISCORD_TOKEN found in environment variables.")
 
+    # Warn about a partial deployment at startup rather than on first use, and
+    # once rather than on every Discord reconnect.
+    _check_sound_files()
+
     loop = asyncio.get_running_loop()
+    background = set()
+
+    def _request_shutdown():
+        task = asyncio.create_task(bot.close())
+        # asyncio only holds a weak reference to running tasks, so an
+        # unreferenced shutdown task can be garbage-collected mid-flight.
+        background.add(task)
+        task.add_done_callback(background.discard)
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
+            loop.add_signal_handler(sig, _request_shutdown)
         except NotImplementedError:
             # Signal handlers aren't supported on Windows event loops
             pass
@@ -566,9 +657,19 @@ async def _main():
     try:
         async with bot:
             await bot.start(token)
+    except discord.LoginFailure:
+        # The default traceback here is pure noise for the one cause it ever
+        # has: the token is wrong.
+        raise SystemExit(
+            "Discord rejected DISCORD_TOKEN. Check the token in your "
+            "environment (or .env file) against the Developer Portal.") from None
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
+        # Drop queued extractions so shutdown isn't waiting on work nobody
+        # will hear. One already running still has to finish, but yt-dlp's
+        # own socket timeout and retry limit bound how long that takes.
+        _extract_pool.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
