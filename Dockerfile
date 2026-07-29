@@ -24,6 +24,10 @@ COPY . .
 RUN useradd --create-home appuser
 USER appuser
 
+# Optional: audio files mounted here become bot commands (skill.m4a ->
+# !skill); see "Custom sounds" in the README. Absent directory = no customs.
+ENV CUSTOM_SOUNDS_DIR=/custom-sounds
+
 # The bot touches this file every 30s while its Discord connection is up
 # (see _heartbeat in app.py); a stale file fails the health check, so
 # "unhealthy" means "not connected to Discord", not just "process died".

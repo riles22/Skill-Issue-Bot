@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import shutil
 import signal
 import tempfile
@@ -15,6 +16,10 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
+
+# Load .env before anything reads configuration: some settings (the custom
+# sounds directory) are read at import time.
+load_dotenv()
 
 # Initialize the bot with intents
 intents = discord.Intents.default()
@@ -34,6 +39,53 @@ CLIPS = {
     'skill': 'https://www.youtube.com/watch?v=LuE0QMHErQo',
     'ded': 'https://www.youtube.com/watch?v=-LTtripsg5U',
 }
+
+# Local custom clips: every audio file in this directory becomes a command
+# named after the file (skill.m4a -> !skill), played straight from disk — no
+# YouTube involved. A file named like a CLIPS entry replaces that YouTube
+# clip. The directory is optional; in Docker, mount sounds at /custom-sounds.
+CUSTOM_SOUNDS_DIR = os.getenv('CUSTOM_SOUNDS_DIR', '/custom-sounds')
+CUSTOM_SOUND_TYPES = ('.dca', '.mp3', '.m4a', '.ogg', '.opus', '.webm',
+                      '.wav', '.flac', '.aac')
+
+
+def _scan_custom_sounds(directory=None):
+    """Maps command names to the audio files in the custom sounds dir."""
+    directory = directory or CUSTOM_SOUNDS_DIR
+    if not os.path.isdir(directory):
+        return {}
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError as exc:
+        # A mounted directory the container user can't read must degrade
+        # like every other optional resource, not crash-loop the bot
+        log.warning('Cannot read custom sounds directory %s (%s); ignoring it',
+                    directory, exc)
+        return {}
+    sounds = {}
+    for entry in entries:
+        if not os.path.isfile(os.path.join(directory, entry)):
+            continue  # e.g. a stray subdirectory named like an audio file
+        stem, ext = os.path.splitext(entry)
+        if ext.lower() not in CUSTOM_SOUND_TYPES:
+            continue
+        name = stem.lower()
+        if not re.fullmatch(r'[a-z0-9_]+', name):
+            log.warning('Ignoring custom sound %r: file names must use only '
+                        'letters, digits and underscores', entry)
+            continue
+        if name in sounds:
+            log.warning('Ignoring custom sound %r: %r already provides !%s',
+                        entry, os.path.basename(sounds[name]), name)
+            continue
+        sounds[name] = os.path.join(directory, entry)
+    if sounds:
+        log.info('Loaded %d custom sound(s) from %s: %s',
+                 len(sounds), directory, ', '.join(sorted(sounds)))
+    return sounds
+
+
+CUSTOM_SOUNDS = _scan_custom_sounds()
 
 # YouTube-DL options (streaming only, nothing is downloaded)
 YDL_OPTS = {
@@ -510,6 +562,43 @@ async def play_local(ctx, paths):
                 await vc.disconnect()
 
 
+async def play_file(ctx, path):
+    """Joins voice and plays one local audio file through ffmpeg."""
+    if not await _ready_to_play(ctx):
+        return
+
+    guild_id = ctx.guild.id
+
+    # Same ordering rules as every other play command
+    _play_requests[guild_id] += 1
+
+    async with _play_locks[guild_id]:
+        _play_generation[guild_id] += 1
+        generation = _play_generation[guild_id]
+
+        vc = await _connect_to_caller(ctx)
+        if vc is None:
+            return
+
+        if vc.is_playing():
+            vc.stop()
+
+        if not vc.is_connected():
+            await _reply(ctx, "Bot is not connected to a voice channel.")
+            return
+
+        # Like the horns, successful plays are silent in chat
+        try:
+            # No reconnect flags: this reads a local file, not a stream
+            source = discord.FFmpegPCMAudio(path, options='-vn')
+            vc.play(source, after=_make_after_playing(vc, guild_id, generation))
+        except Exception:
+            log.exception('Error playing custom sound')
+            await _reply(ctx, "Couldn't play that sound. Check the bot logs for details.")
+            if not vc.is_playing():
+                await vc.disconnect()
+
+
 async def play_horn(ctx, collection, sound_name=None):
     """Plays a sound from a collection: named if given, weighted-random if not."""
     if sound_name:
@@ -553,8 +642,35 @@ def _make_clip_command(name, url):
     return _cmd
 
 
-for _name, _url in CLIPS.items():
-    _make_clip_command(_name, _url)
+def _make_custom_command(name, path):
+    """Registers a bot command that plays a local audio file."""
+    @bot.command(name=name, help=f"Plays the '{name}' custom sound.")
+    @commands.cooldown(1, 3, commands.BucketType.guild)
+    async def _cmd(ctx):
+        if not os.path.isfile(path):
+            log.error('Missing custom sound file: %s', path)
+            await _reply(ctx, "That sound is missing from this deployment. "
+                              "Check the bot logs for details.")
+            return
+        if path.lower().endswith('.dca'):
+            # .dca is pre-encoded Opus: stream it natively like the horns
+            # (ffmpeg cannot probe the raw length-prefixed DCA framing)
+            await play_local(ctx, [path])
+        else:
+            await play_file(ctx, path)
+    return _cmd
+
+
+def _register_clip_commands():
+    """Registers YouTube clip commands, minus those replaced by a custom file."""
+    for name, url in CLIPS.items():
+        if name in CUSTOM_SOUNDS:
+            log.info('Custom sound overrides the %r YouTube clip', name)
+            continue
+        _make_clip_command(name, url)
+
+
+_register_clip_commands()
 
 
 def _make_horn_command(collection):
@@ -579,9 +695,17 @@ async def clips(ctx):
     """Lists the available clips and airhorn commands."""
     clip_names = ' '.join(f'`!{name}`' for name in sorted(CLIPS))
     horn_names = ' '.join(f"`!{c['commands'][0]}`" for c in SOUND_COLLECTIONS)
+    # Only customs that actually registered (conflicts with built-in names are
+    # skipped), and overriding customs already show up under Clips
+    extra_customs = sorted(_registered_customs - set(CLIPS))
+    custom_line = ''
+    if extra_customs:
+        custom_names = ' '.join(f'`!{name}`' for name in extra_customs)
+        custom_line = f"Custom sounds: {custom_names}\n"
     await _reply(
         ctx,
         f"Clips: {clip_names}\n"
+        f"{custom_line}"
         f"Airhorns: {horn_names} — add a sound name to pick one, e.g. `!airhorn truck`.\n"
         f"`!help` lists every alias and `!leave` kicks me out of voice."
     )
@@ -598,6 +722,30 @@ async def leave(ctx):
         await _reply(ctx, "Disconnected.")
     else:
         await _reply(ctx, "I am not in a voice channel.")
+
+
+# Custom sound names that actually became commands (conflicts excluded);
+# the !clips listing advertises these rather than the raw scan results
+_registered_customs = set()
+
+
+def _register_custom_sounds():
+    """Registers custom sound commands, skipping names already taken.
+
+    Runs after every built-in command is defined so the conflict check sees
+    them all (including aliases). CLIPS names deliberately don't conflict: a
+    matching custom sound suppressed the YouTube command's registration above.
+    """
+    for name, path in sorted(CUSTOM_SOUNDS.items()):
+        if bot.get_command(name) is not None:
+            log.warning('Ignoring custom sound %r: a !%s command already exists',
+                        os.path.basename(path), name)
+            continue
+        _make_custom_command(name, path)
+        _registered_customs.add(name)
+
+
+_register_custom_sounds()
 
 
 @bot.event
@@ -661,8 +809,6 @@ async def _heartbeat(path, interval=HEARTBEAT_INTERVAL):
 
 async def _main():
     """Runs the bot, shutting down cleanly on SIGINT/SIGTERM."""
-    load_dotenv()
-
     # Validated here rather than at import so importing the module (tests,
     # tooling) never requires a token.
     token = os.getenv('DISCORD_TOKEN')

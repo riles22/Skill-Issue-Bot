@@ -51,6 +51,11 @@ commands_mock.CommandOnCooldown = type('CommandOnCooldown', (Exception,), {})
 # but it must happen after the sys.modules mocks above — hence the noqa.
 import app  # noqa: E402
 
+# Snapshot taken at import on purpose: config like CUSTOM_SOUNDS_DIR is read
+# while the module loads, so .env must have been loaded by then — a check at
+# test time couldn't tell import-time loading from a later call.
+_DOTENV_LOADED_AT_IMPORT = sys.modules['dotenv'].load_dotenv.called
+
 
 def make_voice_ctx():
     """Build a ctx mock for a user in a guild voice channel, plus the voice client."""
@@ -94,6 +99,7 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
         app._play_locks.clear()
         app._play_requests.clear()
         app._play_generation.clear()
+        app._registered_customs.clear()
         app._cookie_cache = None
         # Reset the shared yt_dlp mock so a side_effect configured by one
         # test can't leak into another (test order must not matter)
@@ -251,6 +257,187 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
 
         ctx.send.assert_called_with("You are not connected to a voice channel.")
         vc.play.assert_not_called()
+
+    def test_scan_custom_sounds_maps_files_to_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for fname in ('skill.m4a', 'horn.dca', 'UPPER.MP3',
+                          'notes.txt', 'bad name.mp3'):
+                open(os.path.join(tmp, fname), 'w').close()
+
+            sounds = app._scan_custom_sounds(tmp)
+
+        # Audio files map by lowercased stem; non-audio and bad names don't
+        self.assertEqual(sorted(sounds), ['horn', 'skill', 'upper'])
+        self.assertTrue(sounds['skill'].endswith('skill.m4a'))
+
+    def test_scan_custom_sounds_missing_dir_is_empty(self):
+        self.assertEqual(app._scan_custom_sounds('/nope/nothing-here'), {})
+
+    def test_scan_custom_sounds_unreadable_dir_degrades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('os.listdir', side_effect=PermissionError('denied')):
+                # Must log and carry on, not crash the bot at import
+                self.assertEqual(app._scan_custom_sounds(tmp), {})
+
+    def test_scan_custom_sounds_skips_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A stray unzip/scp artifact must not shadow a real command
+            os.mkdir(os.path.join(tmp, 'skill.m4a'))
+            open(os.path.join(tmp, 'real.mp3'), 'w').close()
+
+            sounds = app._scan_custom_sounds(tmp)
+
+        self.assertEqual(list(sounds), ['real'])
+
+    def test_scan_custom_sounds_duplicate_stems_keep_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, 'a.mp3'), 'w').close()
+            open(os.path.join(tmp, 'a.wav'), 'w').close()
+
+            sounds = app._scan_custom_sounds(tmp)
+
+        self.assertEqual(list(sounds), ['a'])
+        self.assertTrue(sounds['a'].endswith('a.mp3'))
+
+    async def test_play_file_plays_silently_without_reconnect_flags(self):
+        ctx, vc = make_voice_ctx()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'bruh.mp3')
+            open(path, 'w').close()
+
+            with patch.object(app.discord, 'FFmpegPCMAudio') as ffmpeg:
+                await app.play_file(ctx, path)
+
+        ffmpeg.assert_called_once_with(path, options='-vn')
+        vc.play.assert_called_once()
+        ctx.send.assert_not_called()  # like the horns, success is silent
+
+    async def test_play_file_claims_a_request_slot(self):
+        ctx, vc = make_voice_ctx()
+        before = app._play_requests[ctx.guild.id]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'bruh.mp3')
+            open(path, 'w').close()
+
+            with patch.object(app.discord, 'FFmpegPCMAudio'):
+                await app.play_file(ctx, path)
+
+        # A custom play must stale-out any still-extracting YouTube clip
+        self.assertEqual(app._play_requests[ctx.guild.id], before + 1)
+
+    async def test_custom_command_reports_missing_file(self):
+        cmd = app._make_custom_command('gone', '/nope/gone.mp3')
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+
+        with patch.object(app, 'play_file', AsyncMock()) as play:
+            await cmd(ctx)
+
+        play.assert_not_awaited()
+        self.assertIn('missing from this deployment', ctx.send.call_args.args[0])
+
+    async def test_custom_command_routes_dca_natively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'horn.dca')
+            open(path, 'w').close()
+            cmd = app._make_custom_command('horn', path)
+            ctx = MagicMock()
+
+            with patch.object(app, 'play_local', AsyncMock()) as play:
+                await cmd(ctx)
+
+        play.assert_awaited_once_with(ctx, [path])
+
+    async def test_custom_command_routes_audio_through_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'bruh.mp3')
+            open(path, 'w').close()
+            cmd = app._make_custom_command('bruh', path)
+            ctx = MagicMock()
+
+            with patch.object(app, 'play_file', AsyncMock()) as play:
+                await cmd(ctx)
+
+        play.assert_awaited_once_with(ctx, path)
+
+    async def test_custom_command_routes_uppercase_dca_natively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'HORN.DCA')
+            open(path, 'w').close()
+            cmd = app._make_custom_command('horn', path)
+            ctx = MagicMock()
+
+            # ffmpeg can't probe raw DCA framing, so routing must not depend
+            # on the file name's case
+            with patch.object(app, 'play_local', AsyncMock()) as play:
+                await cmd(ctx)
+
+        play.assert_awaited_once_with(ctx, [path])
+
+    async def test_play_file_reports_a_lost_connection(self):
+        ctx, vc = make_voice_ctx()
+        vc.is_connected.return_value = False
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'bruh.mp3')
+            open(path, 'w').close()
+
+            with patch.object(app.discord, 'FFmpegPCMAudio'):
+                await app.play_file(ctx, path)
+
+        vc.play.assert_not_called()
+        self.assertIn('not connected', ctx.send.call_args.args[0])
+
+    async def test_play_file_after_callback_disconnects_when_current(self):
+        ctx, vc = make_voice_ctx()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'bruh.mp3')
+            open(path, 'w').close()
+
+            with patch.object(app.discord, 'FFmpegPCMAudio'):
+                await app.play_file(ctx, path)
+
+        # The finished-clip callback must be wired to the generation logic
+        after = vc.play.call_args.kwargs['after']
+        with patch('asyncio.run_coroutine_threadsafe') as rct:
+            after(None)
+            rct.assert_called_once()
+            rct.call_args.args[0].close()  # tidy up the un-awaited coroutine
+
+    def test_custom_file_suppresses_matching_clip_command(self):
+        with patch.dict(app.CUSTOM_SOUNDS, {'skill': '/x/skill.m4a'}, clear=True), \
+                patch.object(app, '_make_clip_command') as make:
+            app._register_clip_commands()
+
+        # 'skill' has a custom replacement; only 'ded' registers from CLIPS
+        make.assert_called_once_with('ded', app.CLIPS['ded'])
+
+    def test_custom_registration_skips_taken_names(self):
+        taken = {'stan'}  # e.g. the cow-horn command
+        with patch.dict(app.CUSTOM_SOUNDS,
+                        {'stan': '/x/stan.mp3', 'fresh': '/x/fresh.mp3'},
+                        clear=True), \
+                patch.object(app, '_make_custom_command') as make, \
+                patch.object(app.bot, 'get_command',
+                             side_effect=lambda n: object() if n in taken else None):
+            app._register_custom_sounds()
+
+        make.assert_called_once_with('fresh', '/x/fresh.mp3')
+        self.assertEqual(app._registered_customs, {'fresh'})
+
+    async def test_clips_command_lists_registered_customs_only(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        # 'skill' overrides a CLIPS name (already listed under Clips);
+        # 'bruh' is genuinely new; a skipped conflict never lands in the set
+        with patch.object(app, '_registered_customs', {'bruh', 'skill'}):
+            await app.clips(ctx)
+
+        message = ctx.send.call_args.args[0]
+        self.assertIn('Custom sounds: `!bruh`', message)
+        self.assertEqual(message.count('!skill'), 1)
+
+    def test_dotenv_loads_at_import_for_import_time_config(self):
+        self.assertTrue(_DOTENV_LOADED_AT_IMPORT)
 
     def test_requirements_pull_in_discord_voice_support(self):
         # Plain discord.py can't join voice: the [voice] extra installs
