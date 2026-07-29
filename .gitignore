@@ -38,3 +38,7 @@ ENV/
 # IDE settings
 .vscode/
 .idea/
+
+# Deployment-local custom sounds (see "Custom sounds" in the README):
+# audio ripped from YouTube is not redistributable, so it stays out of git
+custom-sounds/

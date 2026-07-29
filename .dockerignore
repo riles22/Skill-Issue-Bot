@@ -15,3 +15,4 @@ requirements-dev.txt
 ruff.toml
 venv
 .venv
+custom-sounds/

@@ -4,6 +4,10 @@ services:
     image: skill-issue-bot
     env_file: .env
     restart: unless-stopped
+    # Audio files dropped in ./custom-sounds become bot commands
+    # (skill.m4a -> !skill); see "Custom sounds" in the README.
+    volumes:
+      - ./custom-sounds:/custom-sounds:ro
     # This runs for months at a time on small hosts; without a cap the JSON
     # log file grows until it fills the disk.
     logging:

@@ -55,6 +55,39 @@ CLIPS = {
 
 The command (`!mynewclip`) is registered automatically.
 
+### Custom sounds (local files, no YouTube)
+
+Any audio file dropped in the custom sounds folder becomes a command, named
+after the file: `skill.m4a` → `!skill`, `bruh.mp3` → `!bruh`. Common formats
+work (mp3, m4a, ogg, opus, webm, wav, flac, aac — plus pre-encoded `.dca`),
+and file names must use only letters, digits and underscores. A file named
+like one of the YouTube clips **replaces** it — which is also the easiest way
+to make `!skill`/`!ded` immune to YouTube's cloud-IP blocking:
+
+1. On your own computer, grab the audio once —
+   `yt-dlp -f bestaudio -o skill.m4a "https://www.youtube.com/watch?v=..."` —
+   or use any audio file you already have.
+2. Copy it to the host: `scp skill.m4a ubuntu@your-vm:~/custom-sounds/`
+3. Run the container with the folder mounted (compose already does this
+   with a `./custom-sounds` folder next to `compose.yaml`):
+
+   ```bash
+   docker run -d --name skill-issue-bot --restart unless-stopped \
+     --log-opt max-size=10m --log-opt max-file=3 \
+     -e DISCORD_TOKEN=your-token-here \
+     -v /home/ubuntu/custom-sounds:/custom-sounds:ro \
+     ghcr.io/riles22/skill-issue-bot:latest
+   ```
+
+The folder is scanned at startup, so restart after adding files
+(`docker restart skill-issue-bot`). Outside Docker, point the
+`CUSTOM_SOUNDS_DIR` environment variable at your folder.
+
+Custom sound files stay out of this repository on purpose: the airhorn
+sounds are MIT-licensed, but audio ripped from YouTube generally is not
+redistributable, so it belongs in your deployment, not in git (the
+`custom-sounds/` folder is git-ignored for exactly that reason).
+
 ## Setup
 
 ### 1. Create the Discord application
