@@ -94,6 +94,7 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
         app._play_locks.clear()
         app._play_requests.clear()
         app._play_generation.clear()
+        app._cookie_cache = None
         # Reset the shared yt_dlp mock so a side_effect configured by one
         # test can't leak into another (test order must not matter)
         app.yt_dlp.YoutubeDL.reset_mock(return_value=True, side_effect=True)
@@ -250,6 +251,44 @@ class TestBotLogic(unittest.IsolatedAsyncioTestCase):
 
         ctx.send.assert_called_with("You are not connected to a voice channel.")
         vc.play.assert_not_called()
+
+    def test_requirements_pull_in_discord_voice_support(self):
+        # Plain discord.py can't join voice: the [voice] extra installs
+        # PyNaCl and davey (DAVE E2EE). Without it every voice connect dies
+        # with "davey library needed in order to use voice".
+        path = os.path.join(os.path.dirname(os.path.abspath(app.__file__)),
+                            'requirements.txt')
+        with open(path) as f:
+            requirements = f.read()
+        self.assertIn('discord.py[voice]', requirements)
+
+    def test_no_cookie_file_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('YTDLP_COOKIES', None)
+            self.assertNotIn('cookiefile', app._ydl_opts())
+
+    def test_cookies_used_via_writable_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, 'cookies.txt')
+            with open(src, 'w') as f:
+                f.write('# Netscape HTTP Cookie File\n')
+
+            with patch.dict(os.environ, {'YTDLP_COOKIES': src}):
+                opts = app._ydl_opts()
+                self.assertIn('cookiefile', opts)
+                # A copy, not the original: yt-dlp rewrites the cookie file,
+                # and the original may be a read-only mount
+                self.assertNotEqual(opts['cookiefile'], src)
+                with open(opts['cookiefile']) as f:
+                    self.assertIn('Netscape', f.read())
+                # The copy is made once and reused
+                self.assertEqual(app._ydl_opts()['cookiefile'],
+                                 opts['cookiefile'])
+            os.unlink(opts['cookiefile'])
+
+    def test_missing_cookie_file_is_ignored(self):
+        with patch.dict(os.environ, {'YTDLP_COOKIES': '/nope/cookies.txt'}):
+            self.assertNotIn('cookiefile', app._ydl_opts())
 
     def test_ydl_opts_bound_network_operations(self):
         # Real, sane bounds — not just key presence

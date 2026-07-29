@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import random
+import shutil
 import signal
+import tempfile
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -337,6 +339,45 @@ def _make_after_playing(vc, guild_id, generation):
 # event loop's default executor (which discord.py and the rest of the app use).
 _extract_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='yt-extract')
 
+# Lazily created writable copy of the YTDLP_COOKIES file (None until made)
+_cookie_cache = None
+
+
+def _cookie_file():
+    """Returns a writable copy of the YTDLP_COOKIES file, or None if unset.
+
+    YouTube refuses most datacenter/cloud IPs without account cookies ("Sign
+    in to confirm you're not a bot"), so hosts can point YTDLP_COOKIES at a
+    Netscape-format cookies.txt. yt-dlp rewrites the cookie file with rotated
+    values, so it gets a private writable copy rather than the original,
+    which may be a read-only mount.
+    """
+    global _cookie_cache
+    src = os.getenv('YTDLP_COOKIES')
+    if not src:
+        return None
+    if _cookie_cache is None:
+        if not os.path.isfile(src):
+            log.warning('YTDLP_COOKIES=%s does not exist; ignoring it', src)
+            return None
+        fd, path = tempfile.mkstemp(prefix='yt-cookies-', suffix='.txt')
+        with os.fdopen(fd, 'wb') as out, open(src, 'rb') as f:
+            shutil.copyfileobj(f, out)
+        _cookie_cache = path
+    return _cookie_cache
+
+
+def _ydl_opts():
+    """YDL_OPTS plus the optional cookie file.
+
+    Resolved per-extraction rather than at import so a .env loaded in _main
+    (or a cookie file mounted after startup) is honored.
+    """
+    cookies = _cookie_file()
+    if cookies:
+        return {**YDL_OPTS, 'cookiefile': cookies}
+    return dict(YDL_OPTS)
+
 
 async def _extract_audio(url):
     """Resolves stream info for a YouTube URL in a worker thread.
@@ -345,7 +386,7 @@ async def _extract_audio(url):
     can't be killed and runs to completion, but nothing waits on it.
     """
     def extract():
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
             return ydl.extract_info(url, download=False)
 
     loop = asyncio.get_running_loop()
