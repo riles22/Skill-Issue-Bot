@@ -216,6 +216,32 @@ bot against a real server once and check:
 - **Keep `yt-dlp` fresh.** YouTube changes constantly; if clips stop playing
   with extraction errors, rebuild the image (or `pip install -U yt-dlp`) to
   pick up the latest release. Dependabot opens weekly bump PRs for this.
+- **YouTube blocks most cloud/datacenter IPs.** If the logs show
+  `Sign in to confirm you're not a bot` on a cloud VM (Oracle, GCP, AWS, …),
+  YouTube is refusing the host's IP, not malfunctioning — home IPs rarely hit
+  this. The fix is giving yt-dlp account cookies, exactly as its error
+  message suggests:
+  1. On your own computer, sign in to YouTube — **use a throwaway Google
+     account**; the cookie file grants access to that account, so treat it
+     like a password and never use your main account.
+  2. Export cookies in Netscape format with a browser extension such as "Get
+     cookies.txt LOCALLY" ([exporting tips](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)).
+  3. Copy the file to the host (`scp cookies.txt ubuntu@your-vm:~/`) and run
+     the container with it mounted:
+
+     ```bash
+     docker run -d --name skill-issue-bot --restart unless-stopped \
+       --log-opt max-size=10m --log-opt max-file=3 \
+       -e DISCORD_TOKEN=your-token-here \
+       -e YTDLP_COOKIES=/cookies.txt \
+       -v /home/ubuntu/cookies.txt:/cookies.txt:ro \
+       ghcr.io/riles22/skill-issue-bot:latest
+     ```
+
+  A read-only mount is fine — the bot hands yt-dlp a private writable copy
+  (YouTube rotates cookie values on use). If clips stop working months later,
+  re-export the cookies. The airhorn commands never need any of this — they
+  play local files.
 - **YouTube extraction is bounded.** Individual network calls time out after
   10 seconds (with 2 retries) and a whole extraction is capped at 30 seconds.
   Extraction runs in its own small thread pool, before the bot joins voice or
